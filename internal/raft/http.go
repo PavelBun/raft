@@ -4,9 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
+)
+
+const (
+	// Предел тела запроса и ответа. Должен вмещать maxEntriesPerRPC самых длинных команд.
+	maxBodyBytes          = 1 << 20
+	maxCommandBytes       = 4096
+	maxCommandsPerRequest = 100
+	// Сколько POST /log ждёт фиксации. Меньше WriteTimeout сервера в main.go.
+	commitWaitTimeout = 2 * time.Second
 )
 
 // HTTPTransport передаёт сообщения Raft через HTTP/JSON; правила алгоритма в Node.
@@ -32,7 +43,7 @@ func (t HTTPTransport) call(ctx context.Context, address, path string, input, ou
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("RPC %s: HTTP %d", path, res.StatusCode)
 	}
-	return json.NewDecoder(io.LimitReader(res.Body, 65536)).Decode(output)
+	return json.NewDecoder(io.LimitReader(res.Body, maxBodyBytes)).Decode(output)
 }
 
 func (t HTTPTransport) RequestVote(ctx context.Context, address string, req VoteRequest) (VoteResponse, error) {
@@ -41,8 +52,8 @@ func (t HTTPTransport) RequestVote(ctx context.Context, address string, req Vote
 	return res, err
 }
 
-func (t HTTPTransport) Heartbeat(ctx context.Context, address string, req HeartbeatRequest) (HeartbeatResponse, error) {
-	var res HeartbeatResponse
+func (t HTTPTransport) AppendEntries(ctx context.Context, address string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
+	var res AppendEntriesResponse
 	err := t.call(ctx, address, "/raft/append-entries", req, &res)
 	return res, err
 }
@@ -53,9 +64,9 @@ func writeJSON(w http.ResponseWriter, code int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-// Принимаем один JSON-объект размером до 64 КиБ, без неизвестных полей.
+// Принимаем один JSON-объект размером до 1 МиБ, без неизвестных полей.
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 65536)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
@@ -98,23 +109,98 @@ func (n *Node) Handler() http.Handler {
 		}
 		writeJSON(w, 200, res)
 	})
-	// Пока AppendEntries используется только как heartbeat, без репликации журнала.
+	// Входящий AppendEntries: репликация записей или heartbeat с пустым entries.
 	mux.HandleFunc("POST /raft/append-entries", func(w http.ResponseWriter, r *http.Request) {
-		var req HeartbeatRequest
+		var req AppendEntriesRequest
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
-		if req.Term == 0 || !n.member(req.LeaderID) {
-			writeJSON(w, 400, map[string]string{"error": "positive term and known leader_id required"})
+		if err := req.validate(); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
-		res, err := n.HandleHeartbeat(req)
+		if !n.member(req.LeaderID) {
+			writeJSON(w, 400, map[string]string{"error": "known leader_id required"})
+			return
+		}
+		res, err := n.HandleAppendEntries(req)
 		if err != nil {
 			writeJSON(w, 503, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, res)
 	})
+	// Пользовательский API журнала: добавить записи и показать журнал этого узла.
+	mux.HandleFunc("POST /log", n.handleAddEntries)
+	mux.HandleFunc("GET /log", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, n.Log())
+	})
 	return mux
+}
+
+// Тело POST /log: {"command":"x"} или {"commands":["x","y"]}.
+type addEntriesRequest struct {
+	Command  string   `json:"command"`
+	Commands []string `json:"commands"`
+}
+
+// Команды одного запроса или одна команда. Пустые и слишком длинные не принимаем:
+// слишком большая запись не поместилась бы в AppendEntries, и репликация застряла бы.
+func (r addEntriesRequest) commands() ([]string, error) {
+	commands := r.Commands
+	if r.Command != "" {
+		if len(commands) > 0 {
+			return nil, errors.New("use either command or commands")
+		}
+		commands = []string{r.Command}
+	}
+	if len(commands) == 0 || len(commands) > maxCommandsPerRequest {
+		return nil, fmt.Errorf("from 1 to %d commands required", maxCommandsPerRequest)
+	}
+	for _, command := range commands {
+		if command == "" || len(command) > maxCommandBytes {
+			return nil, fmt.Errorf("each command must be from 1 to %d bytes", maxCommandBytes)
+		}
+	}
+	return commands, nil
+}
+
+// handleAddEntries отвечает клиенту только после фиксации записей: как в Raft,
+// успешный ответ означает, что записи уже есть у большинства и не потеряются.
+func (n *Node) handleAddEntries(w http.ResponseWriter, r *http.Request) {
+	var req addEntriesRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	commands, err := req.commands()
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	index, term, err := n.Propose(commands)
+	var notLeader *NotLeaderError
+	if errors.As(err, &notLeader) {
+		// Не лидер: подсказываем клиенту, куда отправить запрос. Лидер может быть неизвестен.
+		writeJSON(w, 409, map[string]string{"error": err.Error(), "leader_id": notLeader.LeaderID, "leader_address": notLeader.LeaderAddress})
+		return
+	}
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": err.Error()})
+		return
+	}
+	first := index - uint64(len(commands)) + 1
+	ctx, cancel := context.WithTimeout(r.Context(), commitWaitTimeout)
+	defer cancel()
+	err = n.WaitCommitted(ctx, index, term)
+	switch {
+	case err == nil:
+		writeJSON(w, 200, map[string]any{"first_index": first, "last_index": index, "term": term, "committed": true})
+	case errors.Is(err, ErrEntryLost):
+		writeJSON(w, 503, map[string]any{"error": err.Error(), "first_index": first, "last_index": index, "term": term, "committed": false})
+	default:
+		// Например, нет большинства. Запись осталась в журнале и ещё может быть зафиксирована.
+		writeJSON(w, 504, map[string]any{"error": "not committed within timeout, may still be committed", "first_index": first, "last_index": index, "term": term, "committed": false})
+	}
 }

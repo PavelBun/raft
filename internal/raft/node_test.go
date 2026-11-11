@@ -24,6 +24,7 @@ func (s *memoryStorage) Save(state PersistentState) error {
 	if s.fail {
 		return errors.New("disk unavailable")
 	}
+	state.Log = append([]Entry(nil), state.Log...)
 	s.state = state
 	return nil
 }
@@ -33,8 +34,8 @@ type offlineTransport struct{}
 func (offlineTransport) RequestVote(context.Context, string, VoteRequest) (VoteResponse, error) {
 	return VoteResponse{}, errors.New("offline")
 }
-func (offlineTransport) Heartbeat(context.Context, string, HeartbeatRequest) (HeartbeatResponse, error) {
-	return HeartbeatResponse{}, errors.New("offline")
+func (offlineTransport) AppendEntries(context.Context, string, AppendEntriesRequest) (AppendEntriesResponse, error) {
+	return AppendEntriesResponse{}, errors.New("offline")
 }
 
 func testNode(t *testing.T, storage Storage) *Node {
@@ -53,7 +54,7 @@ func TestOneVotePerTermAndPersistence(t *testing.T) {
 	if err != nil || !res.VoteGranted {
 		t.Fatalf("first vote: %+v, %v", res, err)
 	}
-	n = testNode(t, storage) // Simulate restarting the process with the same data.
+	n = testNode(t, storage) // Имитируем перезапуск процесса с теми же данными.
 	res, err = n.HandleVote(VoteRequest{Term: 4, CandidateID: "n3"})
 	if err != nil || res.VoteGranted {
 		t.Fatalf("double vote after restart: %+v, %v", res, err)
@@ -106,21 +107,21 @@ func TestHeartbeatAndStaleTerms(t *testing.T) {
 	n.mu.Lock()
 	n.role = Candidate
 	n.mu.Unlock()
-	res, err := n.HandleHeartbeat(HeartbeatRequest{Term: 3, LeaderID: "n2"})
+	res, err := n.HandleAppendEntries(AppendEntriesRequest{Term: 3, LeaderID: "n2"})
 	if err != nil || !res.Success || n.Status().Role != Follower || n.Status().VotedFor != "n2" {
 		t.Fatalf("same-term heartbeat: %+v %v", res, err)
 	}
 	n.mu.Lock()
 	deadline := n.deadline
 	n.mu.Unlock()
-	res, _ = n.HandleHeartbeat(HeartbeatRequest{Term: 2, LeaderID: "n3"})
+	res, _ = n.HandleAppendEntries(AppendEntriesRequest{Term: 2, LeaderID: "n3"})
 	n.mu.Lock()
 	after := n.deadline
 	n.mu.Unlock()
 	if res.Success || res.Term != 3 || !deadline.Equal(after) {
 		t.Fatal("stale heartbeat accepted or reset timer")
 	}
-	res, _ = n.HandleHeartbeat(HeartbeatRequest{Term: 6, LeaderID: "n3"})
+	res, _ = n.HandleAppendEntries(AppendEntriesRequest{Term: 6, LeaderID: "n3"})
 	status := n.Status()
 	if !res.Success || status.Term != 6 || status.VotedFor != "" || status.LeaderID != "n3" {
 		t.Fatalf("higher term: %+v", status)
@@ -137,7 +138,7 @@ func TestStorageFailureStopsVoting(t *testing.T) {
 	if err == nil || res.VoteGranted || n.Status().Error == "" {
 		t.Fatal("vote granted without durable state")
 	}
-	if _, err := n.HandleHeartbeat(HeartbeatRequest{Term: 2, LeaderID: "n3"}); err == nil {
+	if _, err := n.HandleAppendEntries(AppendEntriesRequest{Term: 2, LeaderID: "n3"}); err == nil {
 		t.Fatal("failed node continued participating")
 	}
 }
@@ -171,7 +172,7 @@ func TestHTTPValidation(t *testing.T) {
 	}
 }
 
-// Real HTTP servers exercise transport, timers, election and failover together.
+// Настоящие HTTP-серверы проверяют вместе транспорт, таймеры, выборы и смену лидера.
 func newCluster(t *testing.T, size int) ([]*Node, []func()) {
 	t.Helper()
 	servers := make([]*httptest.Server, size)
@@ -249,7 +250,7 @@ func TestClusterElectionAndFailover(t *testing.T) {
 		return true
 	})
 	oldTerm := nodes[leader].Status().Term
-	// With heartbeats arriving, the cluster should keep the same leader and term.
+	// Пока приходят heartbeat, кластер должен сохранять того же лидера и срок.
 	time.Sleep(700 * time.Millisecond)
 	for _, n := range nodes {
 		if n.Status().Term != oldTerm {
@@ -268,7 +269,7 @@ func TestClusterElectionAndFailover(t *testing.T) {
 		}
 		return count == 1 && nodes[newLeader].Status().Term > oldTerm
 	})
-	// After losing two nodes the remaining follower must not elect itself.
+	// После потери двух узлов оставшийся follower не должен стать лидером.
 	stops[newLeader]()
 	remaining := 3 - leader - newLeader
 	time.Sleep(1200 * time.Millisecond)
@@ -300,8 +301,8 @@ func (d delayedTransport) RequestVote(ctx context.Context, _ string, _ VoteReque
 	}
 }
 
-func (d delayedTransport) Heartbeat(context.Context, string, HeartbeatRequest) (HeartbeatResponse, error) {
-	return HeartbeatResponse{}, errors.New("offline")
+func (d delayedTransport) AppendEntries(context.Context, string, AppendEntriesRequest) (AppendEntriesResponse, error) {
+	return AppendEntriesResponse{}, errors.New("offline")
 }
 
 func TestLateVoteCannotWinNewTerm(t *testing.T) {
@@ -311,9 +312,12 @@ func TestLateVoteCannotWinNewTerm(t *testing.T) {
 	n.state = PersistentState{Term: 1, VotedFor: "n1"}
 	n.role, n.votes = Candidate, 1
 	done := make(chan struct{})
-	go func() { n.requestVote(context.Background(), "http://n2", 1); close(done) }()
+	go func() {
+		n.requestVote(context.Background(), "http://n2", VoteRequest{Term: 1, CandidateID: "n1"})
+		close(done)
+	}()
 	<-d.started
-	_, _ = n.HandleHeartbeat(HeartbeatRequest{Term: 2, LeaderID: "n3"})
+	_, _ = n.HandleAppendEntries(AppendEntriesRequest{Term: 2, LeaderID: "n3"})
 	d.reply <- VoteResponse{Term: 1, VoteGranted: true}
 	<-done
 	if status := n.Status(); status.Term != 2 || status.Role != Follower || status.LeaderID != "n3" {
@@ -328,7 +332,7 @@ func TestHigherTermResponseStepsDown(t *testing.T) {
 	n.state = PersistentState{Term: 1, VotedFor: "n1"}
 	n.role, n.leaderID = Leader, "n1"
 	d.reply <- VoteResponse{Term: 8}
-	n.requestVote(context.Background(), "http://n2", 1)
+	n.requestVote(context.Background(), "http://n2", VoteRequest{Term: 1, CandidateID: "n1"})
 	if status := n.Status(); status.Term != 8 || status.Role != Follower || status.VotedFor != "" {
 		t.Fatalf("higher-term reply ignored: %+v", status)
 	}

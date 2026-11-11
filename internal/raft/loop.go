@@ -1,7 +1,7 @@
 package raft
 
-// Цикл узла: тикер проверяет сроки, а решения о выборах и heartbeat
-// принимаются в handleTick. Сами правила Raft — в election.go и heartbeat.go.
+// Цикл узла: тикер проверяет сроки, а решения о выборах и AppendEntries
+// принимаются в handleTick. Сами правила Raft — в election.go и replication.go.
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 )
 
 // Run вызывается один раз и управляет жизненным циклом: ждёт тик или отмену.
-// Решения о выборах и heartbeat вынесены в handleTick и отдельные методы.
+// Решения о выборах и репликации вынесены в handleTick и отдельные методы.
 func (n *Node) Run(ctx context.Context) error {
 	n.mu.Lock()
 	if n.running {
@@ -27,7 +27,7 @@ func (n *Node) Run(ctx context.Context) error {
 	defer func() { cancel(); workers.Wait() }()
 	// Тикер периодически присылает время в канал ticker.C.
 	// Каждые 10 мс мы лишь проверяем, истёк ли таймаут выборов или пора ли
-	// отправлять heartbeat. Это НЕ выборы и НЕ рассылка каждые 10 мс:
+	// отправлять AppendEntries. Это НЕ выборы и НЕ рассылка каждые 10 мс:
 	// их интервалы задаются отдельно в cfg (по умолчанию 600–1200 и 100 мс).
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -57,16 +57,18 @@ func (n *Node) handleTick(ctx context.Context, now time.Time, workers *sync.Wait
 			n.mu.Unlock()
 			return err
 		}
-		term := n.state.Term
+		req := n.voteRequestLocked()
 		n.mu.Unlock()
-		n.broadcastVoteRequests(ctx, workers, term)
+		n.broadcastVoteRequests(ctx, workers, req)
 		return nil
 	}
+	// Лидер шлёт AppendEntries раз в Heartbeat или сразу после новой команды клиента:
+	// тогда Propose обнуляет nextHeartbeat.
 	if n.role == Leader && !now.Before(n.nextHeartbeat) {
 		term := n.state.Term
 		n.nextHeartbeat = now.Add(n.cfg.Heartbeat)
 		n.mu.Unlock()
-		n.broadcastHeartbeats(ctx, workers, term)
+		n.broadcastAppendEntries(ctx, workers, term)
 		return nil
 	}
 	n.mu.Unlock()

@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 )
 
-// PersistentState переживает перезапуск: нельзя забывать срок и голос,
-// иначе узел сможет проголосовать за двух разных кандидатов в одном сроке.
+// PersistentState переживает перезапуск (Figure 2: currentTerm, votedFor, log[]).
+// Забытый голос позволил бы проголосовать дважды в одном сроке, а забытый
+// журнал — потерять запись, которую лидер уже посчитал зафиксированной.
 type PersistentState struct {
-	Term     uint64 `json:"term"`
-	VotedFor string `json:"voted_for"`
+	Term     uint64  `json:"term"`
+	VotedFor string  `json:"voted_for"`
+	Log      []Entry `json:"log"`
 }
 
 // Интерфейс позволяет использовать файл в приложении и память в тестах.
@@ -40,7 +42,9 @@ func (s FileStorage) Load() (PersistentState, error) {
 	return state, nil
 }
 
-// Save вызывается ядром до подтверждения голоса или отправки запросов нового срока.
+// Save вызывается ядром до подтверждения голоса, до ответа success на
+// AppendEntries и до рассылки новых записей лидером. Файл перезаписывается
+// целиком: для учебного журнала этого достаточно.
 func (s FileStorage) Save(state PersistentState) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0755); err != nil {
 		return err

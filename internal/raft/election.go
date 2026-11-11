@@ -1,7 +1,7 @@
 package raft
 
-// Выборы лидера: обработка чужого запроса голоса (HandleVote),
-// начало собственной кампании, рассылка RequestVote и подсчёт голосов.
+// Выборы лидера (§5.2 и §5.4.1 статьи о Raft): обработка чужого запроса голоса
+// (HandleVote), начало собственной кампании, рассылка RequestVote и подсчёт голосов.
 
 import (
 	"context"
@@ -27,9 +27,10 @@ func (n *Node) HandleVote(req VoteRequest) (VoteResponse, error) {
 	if req.Term < n.state.Term {
 		return res, nil
 	}
-	// Журналов пока нет. Проверка актуальности журнала кандидата появится на этапе 2.
-	// Можно голосовать впервые или подтвердить голос тому же кандидату в этом сроке.
-	if n.state.VotedFor == "" || n.state.VotedFor == req.CandidateID {
+	// Голосуем, только если ещё не голосовали в этом сроке (или голосовали за него же)
+	// и журнал кандидата не хуже нашего. Иначе лидером мог бы стать узел,
+	// у которого нет уже зафиксированных записей (§5.4.1).
+	if (n.state.VotedFor == "" || n.state.VotedFor == req.CandidateID) && n.candidateLogUpToDateLocked(req) {
 		n.state.VotedFor = req.CandidateID
 		// Сначала сохраняем голос, только потом отвечаем vote_granted=true.
 		if err := n.persistLocked(); err != nil {
@@ -39,6 +40,15 @@ func (n *Node) HandleVote(req VoteRequest) (VoteResponse, error) {
 		res.VoteGranted = true
 	}
 	return res, nil
+}
+
+// Журнал кандидата «не хуже», если его последняя запись из более позднего срока,
+// а при равных сроках — если его журнал не короче нашего.
+func (n *Node) candidateLogUpToDateLocked(req VoteRequest) bool {
+	if req.LastLogTerm != n.lastLogTerm() {
+		return req.LastLogTerm > n.lastLogTerm()
+	}
+	return req.LastLogIndex >= n.lastLogIndex()
 }
 
 // startElectionLocked начинает кампанию: новый срок, свой голос и новый таймаут.
@@ -59,22 +69,29 @@ func (n *Node) startElectionLocked() error {
 	return nil
 }
 
+// Запрос голоса собирается под mutex сразу после начала кампании:
+// срок и последняя запись журнала должны соответствовать именно ей.
+func (n *Node) voteRequestLocked() VoteRequest {
+	return VoteRequest{Term: n.state.Term, CandidateID: n.cfg.ID, LastLogIndex: n.lastLogIndex(), LastLogTerm: n.lastLogTerm()}
+}
+
 // Каждому peer отправляем отдельный запрос в своей goroutine, не ждём всех ответов.
-// Ответ и голос обрабатывает requestVote; term привязывает запрос к этой кампании.
-func (n *Node) broadcastVoteRequests(ctx context.Context, workers *sync.WaitGroup, term uint64) {
+// Ответ и голос обрабатывает requestVote; req.Term привязывает запрос к этой кампании.
+func (n *Node) broadcastVoteRequests(ctx context.Context, workers *sync.WaitGroup, req VoteRequest) {
 	for _, address := range n.cfg.Peers {
 		workers.Add(1)
 		go func(address string) {
 			defer workers.Done()
-			n.requestVote(ctx, address, term)
+			n.requestVote(ctx, address, req)
 		}(address)
 	}
 }
 
 // requestVote просит голос у одного peer и учитывает его ответ в общей кампании.
-func (n *Node) requestVote(ctx context.Context, address string, term uint64) {
+func (n *Node) requestVote(ctx context.Context, address string, req VoteRequest) {
+	term := req.Term
 	// Пока ждём сеть, mutex свободен: входящие сообщения продолжают обрабатываться.
-	res, err := n.transport.RequestVote(ctx, address, VoteRequest{Term: term, CandidateID: n.cfg.ID})
+	res, err := n.transport.RequestVote(ctx, address, req)
 	if err != nil {
 		return
 	} // Нет ответа — нет голоса; это не доказательство отказа узла.
@@ -99,8 +116,16 @@ func (n *Node) requestVote(ctx context.Context, address string, term uint64) {
 }
 
 // becomeLeaderLocked вызывается, когда кандидат набрал большинство голосов.
+// Лидер пока ничего не знает о журналах peer: предполагает, что они совпадают
+// с его журналом (nextIndex = последний+1), а подтверждённого совпадения нет (matchIndex = 0).
 func (n *Node) becomeLeaderLocked() {
 	n.role, n.leaderID = Leader, n.cfg.ID
-	n.nextHeartbeat = time.Time{} // Первый heartbeat будет отправлен на ближайшем тике.
+	n.nextIndex = make(map[string]uint64, len(n.cfg.Peers))
+	n.matchIndex = make(map[string]uint64, len(n.cfg.Peers))
+	for id := range n.cfg.Peers {
+		n.nextIndex[id] = n.lastLogIndex() + 1
+		n.matchIndex[id] = 0
+	}
+	n.nextHeartbeat = time.Time{} // Первый AppendEntries будет отправлен на ближайшем тике.
 	n.logger.Info("became leader", "id", n.cfg.ID, "term", n.state.Term, "votes", n.votes)
 }
