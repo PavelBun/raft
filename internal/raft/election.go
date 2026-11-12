@@ -14,15 +14,10 @@ import (
 func (n *Node) HandleVote(req VoteRequest) (VoteResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.failure != nil {
-		return VoteResponse{}, n.failure
-	}
 	if !n.member(req.CandidateID) {
 		return VoteResponse{}, errors.New("unknown candidate")
 	}
-	if err := n.observeTermLocked(req.Term); err != nil {
-		return VoteResponse{}, err
-	}
+	n.observeTermLocked(req.Term)
 	res := VoteResponse{Term: n.state.Term}
 	if req.Term < n.state.Term {
 		return res, nil
@@ -32,10 +27,6 @@ func (n *Node) HandleVote(req VoteRequest) (VoteResponse, error) {
 	// у которого нет уже зафиксированных записей (§5.4.1).
 	if (n.state.VotedFor == "" || n.state.VotedFor == req.CandidateID) && n.candidateLogUpToDateLocked(req) {
 		n.state.VotedFor = req.CandidateID
-		// Сначала сохраняем голос, только потом отвечаем vote_granted=true.
-		if err := n.persistLocked(); err != nil {
-			return VoteResponse{}, err
-		}
 		n.resetDeadlineLocked()
 		res.VoteGranted = true
 	}
@@ -52,21 +43,16 @@ func (n *Node) candidateLogUpToDateLocked(req VoteRequest) bool {
 }
 
 // startElectionLocked начинает кампанию: новый срок, свой голос и новый таймаут.
-// Состояние сохраняется до отправки первого запроса другим узлам.
-func (n *Node) startElectionLocked() error {
+func (n *Node) startElectionLocked() {
 	n.state.Term++
 	n.state.VotedFor = n.cfg.ID
 	n.role, n.leaderID, n.votes = Candidate, "", 1
 	n.resetDeadlineLocked()
-	if err := n.persistLocked(); err != nil {
-		return err
-	}
 	n.logger.Info("started election", "id", n.cfg.ID, "term", n.state.Term)
 	// Кластер из одного узла уже имеет большинство за счёт собственного голоса.
 	if n.votes >= n.majority() {
 		n.becomeLeaderLocked()
 	}
-	return nil
 }
 
 // Запрос голоса собирается под mutex сразу после начала кампании:
@@ -97,12 +83,7 @@ func (n *Node) requestVote(ctx context.Context, address string, req VoteRequest)
 	} // Нет ответа — нет голоса; это не доказательство отказа узла.
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.failure != nil {
-		return
-	}
-	if err := n.observeTermLocked(res.Term); err != nil {
-		return
-	}
+	n.observeTermLocked(res.Term)
 	// Запоздалые ответы старой кампании нельзя учитывать в новом сроке.
 	if n.role != Candidate || n.state.Term != term || res.Term != term {
 		return

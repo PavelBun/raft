@@ -12,11 +12,11 @@ import (
 )
 
 const (
-	// Предел тела запроса и ответа. Должен вмещать maxEntriesPerRPC самых длинных команд.
+	// Предел тела запроса и ответа. Должен вмещать пачку maxBatchBytes с запасом.
 	maxBodyBytes          = 1 << 20
 	maxCommandBytes       = 4096
 	maxCommandsPerRequest = 100
-	// Сколько POST /log ждёт фиксации. Меньше WriteTimeout сервера в main.go.
+	// Сколько POST /log ждёт фиксации и выполнения. Меньше WriteTimeout сервера в main.go.
 	commitWaitTimeout = 2 * time.Second
 )
 
@@ -84,12 +84,7 @@ func (n *Node) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Пользовательский API: снимок локального состояния, а не опрос всего кластера.
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
-		status := n.Status()
-		code := http.StatusOK
-		if status.Error != "" {
-			code = http.StatusServiceUnavailable
-		}
-		writeJSON(w, code, status)
+		writeJSON(w, 200, n.Status())
 	})
 	// Входящий запрос голоса: JSON → проверка полей → ядро Raft → JSON-ответ.
 	mux.HandleFunc("POST /raft/request-vote", func(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +99,7 @@ func (n *Node) Handler() http.Handler {
 		}
 		res, err := n.HandleVote(req)
 		if err != nil {
-			writeJSON(w, 503, map[string]string{"error": err.Error()})
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, res)
@@ -126,15 +121,18 @@ func (n *Node) Handler() http.Handler {
 		}
 		res, err := n.HandleAppendEntries(req)
 		if err != nil {
-			writeJSON(w, 503, map[string]string{"error": err.Error()})
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, res)
 	})
-	// Пользовательский API журнала: добавить записи и показать журнал этого узла.
-	mux.HandleFunc("POST /log", n.handleAddEntries)
+	// Пользовательский API: добавить записи, показать журнал и состояние key-value этого узла.
+	mux.HandleFunc("POST /log", handleAddEntries(n))
 	mux.HandleFunc("GET /log", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, n.Log())
+	})
+	mux.HandleFunc("GET /kv", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, n.KV())
 	})
 	return mux
 }
@@ -159,48 +157,65 @@ func (r addEntriesRequest) commands() ([]string, error) {
 		return nil, fmt.Errorf("from 1 to %d commands required", maxCommandsPerRequest)
 	}
 	for _, command := range commands {
-		if command == "" || len(command) > maxCommandBytes {
-			return nil, fmt.Errorf("each command must be from 1 to %d bytes", maxCommandBytes)
+		if len(command) > maxCommandBytes {
+			return nil, fmt.Errorf("each command must be at most %d bytes", maxCommandBytes)
+		}
+		// Некорректная команда не должна попасть в журнал всего кластера.
+		if _, err := ParseCommand(command); err != nil {
+			return nil, fmt.Errorf("%q: %w", command, err)
 		}
 	}
 	return commands, nil
 }
 
-// handleAddEntries отвечает клиенту только после фиксации записей: как в Raft,
-// успешный ответ означает, что записи уже есть у большинства и не потеряются.
-func (n *Node) handleAddEntries(w http.ResponseWriter, r *http.Request) {
-	var req addEntriesRequest
-	if err := decodeJSON(w, r, &req); err != nil {
-		writeJSON(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	commands, err := req.commands()
-	if err != nil {
-		writeJSON(w, 400, map[string]string{"error": err.Error()})
-		return
-	}
-	index, term, err := n.Propose(commands)
-	var notLeader *NotLeaderError
-	if errors.As(err, &notLeader) {
-		// Не лидер: подсказываем клиенту, куда отправить запрос. Лидер может быть неизвестен.
-		writeJSON(w, 409, map[string]string{"error": err.Error(), "leader_id": notLeader.LeaderID, "leader_address": notLeader.LeaderAddress})
-		return
-	}
-	if err != nil {
-		writeJSON(w, 503, map[string]string{"error": err.Error()})
-		return
-	}
-	first := index - uint64(len(commands)) + 1
-	ctx, cancel := context.WithTimeout(r.Context(), commitWaitTimeout)
-	defer cancel()
-	err = n.WaitCommitted(ctx, index, term)
-	switch {
-	case err == nil:
-		writeJSON(w, 200, map[string]any{"first_index": first, "last_index": index, "term": term, "committed": true})
-	case errors.Is(err, ErrEntryLost):
-		writeJSON(w, 503, map[string]any{"error": err.Error(), "first_index": first, "last_index": index, "term": term, "committed": false})
-	default:
-		// Например, нет большинства. Запись осталась в журнале и ещё может быть зафиксирована.
-		writeJSON(w, 504, map[string]any{"error": "not committed within timeout, may still be committed", "first_index": first, "last_index": index, "term": term, "committed": false})
+// proposer — всё, что клиентской части нужно от узла: отдать команды и получить каналы.
+type proposer interface {
+	Propose([]string) ([]<-chan ApplyResult, error)
+}
+
+// handleAddEntries — клиентская часть. Она не берёт mutex и не знает правил Raft:
+// отдаёт команды лидеру и ждёт на каналах, пока записи будут зафиксированы
+// и выполнены машиной состояний. Ответ 200 содержит результаты команд.
+func handleAddEntries(node proposer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req addEntriesRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		commands, err := req.commands()
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		pending, err := node.Propose(commands)
+		var notLeader *NotLeaderError
+		if errors.As(err, &notLeader) {
+			// Не лидер: подсказываем клиенту, куда отправить запрос. Лидер может быть неизвестен.
+			writeJSON(w, 409, map[string]string{"error": err.Error(), "leader_id": notLeader.LeaderID, "leader_address": notLeader.LeaderAddress})
+			return
+		}
+		if err != nil {
+			writeJSON(w, 503, map[string]string{"error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), commitWaitTimeout)
+		defer cancel()
+		results := make([]ApplyResult, 0, len(pending))
+		for _, ch := range pending {
+			select {
+			case res := <-ch:
+				if res.Err != nil {
+					writeJSON(w, 503, map[string]any{"error": res.Err.Error(), "index": res.Index, "results": results})
+					return
+				}
+				results = append(results, res)
+			case <-ctx.Done():
+				// Например, нет большинства. Запись осталась в журнале и ещё может быть выполнена.
+				writeJSON(w, 504, map[string]any{"error": "not applied within timeout, may still be applied", "results": results})
+				return
+			}
+		}
+		writeJSON(w, 200, map[string]any{"results": results})
 	}
 }

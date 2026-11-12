@@ -8,26 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
-
-type memoryStorage struct {
-	state PersistentState
-	fail  bool
-}
-
-func (s *memoryStorage) Load() (PersistentState, error) { return s.state, nil }
-func (s *memoryStorage) Save(state PersistentState) error {
-	if s.fail {
-		return errors.New("disk unavailable")
-	}
-	state.Log = append([]Entry(nil), state.Log...)
-	s.state = state
-	return nil
-}
 
 type offlineTransport struct{}
 
@@ -38,26 +22,24 @@ func (offlineTransport) AppendEntries(context.Context, string, AppendEntriesRequ
 	return AppendEntriesResponse{}, errors.New("offline")
 }
 
-func testNode(t *testing.T, storage Storage) *Node {
+func testNode(t *testing.T) *Node {
 	t.Helper()
-	n, err := New(Config{ID: "n1", Peers: map[string]string{"n2": "http://n2", "n3": "http://n3"}, ElectionMin: 150 * time.Millisecond, ElectionMax: 300 * time.Millisecond, Heartbeat: 40 * time.Millisecond}, storage, offlineTransport{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n, err := New(Config{ID: "n1", Peers: map[string]string{"n2": "http://n2", "n3": "http://n3"}, ElectionMin: 150 * time.Millisecond, ElectionMax: 300 * time.Millisecond, Heartbeat: 40 * time.Millisecond}, offlineTransport{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return n
 }
 
-func TestOneVotePerTermAndPersistence(t *testing.T) {
-	storage := FileStorage{Path: filepath.Join(t.TempDir(), "state.json")}
-	n := testNode(t, storage)
+func TestOneVotePerTerm(t *testing.T) {
+	n := testNode(t)
 	res, err := n.HandleVote(VoteRequest{Term: 4, CandidateID: "n2"})
 	if err != nil || !res.VoteGranted {
 		t.Fatalf("first vote: %+v, %v", res, err)
 	}
-	n = testNode(t, storage) // Имитируем перезапуск процесса с теми же данными.
 	res, err = n.HandleVote(VoteRequest{Term: 4, CandidateID: "n3"})
 	if err != nil || res.VoteGranted {
-		t.Fatalf("double vote after restart: %+v, %v", res, err)
+		t.Fatalf("double vote: %+v, %v", res, err)
 	}
 	res, err = n.HandleVote(VoteRequest{Term: 4, CandidateID: "n2"})
 	if err != nil || !res.VoteGranted {
@@ -70,7 +52,7 @@ func TestOneVotePerTermAndPersistence(t *testing.T) {
 }
 
 func TestConcurrentVotes(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	var wg sync.WaitGroup
 	results := make(chan string, 40)
 	for i := 0; i < 40; i++ {
@@ -102,7 +84,7 @@ func TestConcurrentVotes(t *testing.T) {
 }
 
 func TestHeartbeatAndStaleTerms(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	_, _ = n.HandleVote(VoteRequest{Term: 3, CandidateID: "n2"})
 	n.mu.Lock()
 	n.role = Candidate
@@ -132,19 +114,8 @@ func TestHeartbeatAndStaleTerms(t *testing.T) {
 	}
 }
 
-func TestStorageFailureStopsVoting(t *testing.T) {
-	n := testNode(t, &memoryStorage{fail: true})
-	res, err := n.HandleVote(VoteRequest{Term: 1, CandidateID: "n2"})
-	if err == nil || res.VoteGranted || n.Status().Error == "" {
-		t.Fatal("vote granted without durable state")
-	}
-	if _, err := n.HandleAppendEntries(AppendEntriesRequest{Term: 2, LeaderID: "n3"}); err == nil {
-		t.Fatal("failed node continued participating")
-	}
-}
-
 func TestHTTPValidation(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	server := httptest.NewServer(n.Handler())
 	defer server.Close()
 	client := HTTPTransport{Client: &http.Client{Timeout: time.Second}}
@@ -188,7 +159,7 @@ func newCluster(t *testing.T, size int) ([]*Node, []func()) {
 				peers[fmt.Sprintf("n%d", j+1)] = "http://" + servers[j].Listener.Addr().String()
 			}
 		}
-		n, err := New(Config{ID: fmt.Sprintf("n%d", i+1), Peers: peers, ElectionMin: 250 * time.Millisecond, ElectionMax: 500 * time.Millisecond, Heartbeat: 50 * time.Millisecond}, &memoryStorage{}, HTTPTransport{Client: &http.Client{Timeout: 100 * time.Millisecond}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		n, err := New(Config{ID: fmt.Sprintf("n%d", i+1), Peers: peers, ElectionMin: 250 * time.Millisecond, ElectionMax: 500 * time.Millisecond, Heartbeat: 50 * time.Millisecond}, HTTPTransport{Client: &http.Client{Timeout: 100 * time.Millisecond}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -306,7 +277,7 @@ func (d delayedTransport) AppendEntries(context.Context, string, AppendEntriesRe
 }
 
 func TestLateVoteCannotWinNewTerm(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	d := delayedTransport{started: make(chan struct{}), reply: make(chan VoteResponse, 1)}
 	n.transport = d
 	n.state = PersistentState{Term: 1, VotedFor: "n1"}
@@ -326,7 +297,7 @@ func TestLateVoteCannotWinNewTerm(t *testing.T) {
 }
 
 func TestHigherTermResponseStepsDown(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	d := delayedTransport{started: make(chan struct{}), reply: make(chan VoteResponse, 1)}
 	n.transport = d
 	n.state = PersistentState{Term: 1, VotedFor: "n1"}
@@ -339,7 +310,7 @@ func TestHigherTermResponseStepsDown(t *testing.T) {
 }
 
 func TestElectionRetriesWithoutQuorum(t *testing.T) {
-	n := testNode(t, &memoryStorage{})
+	n := testNode(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- n.Run(ctx) }()

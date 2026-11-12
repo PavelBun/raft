@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,14 +45,13 @@ func run() error {
 	id := flag.String("id", "", "Unique node ID, e.g. n1")
 	listen := flag.String("listen", "127.0.0.1:8001", "HTTP listen address")
 	peerList := flag.String("peers", "", "Other nodes: n2=http://127.0.0.1:8002,n3=http://127.0.0.1:8003")
-	data := flag.String("data", "", "State directory (required; unique per node)")
 	electionMin := flag.Duration("election-min", 600*time.Millisecond, "Minimum election timeout")
 	electionMax := flag.Duration("election-max", 1200*time.Millisecond, "Maximum election timeout")
 	heartbeat := flag.Duration("heartbeat", 100*time.Millisecond, "Heartbeat interval")
 	rpcTimeout := flag.Duration("rpc-timeout", 250*time.Millisecond, "HTTP RPC timeout")
 	flag.Parse()
-	if *id == "" || *data == "" || *rpcTimeout <= 0 {
-		return errors.New("-id, -data and positive -rpc-timeout are required")
+	if *id == "" || *rpcTimeout <= 0 {
+		return errors.New("-id and positive -rpc-timeout are required")
 	}
 	peers, err := parsePeers(*peerList, *id)
 	if err != nil {
@@ -62,9 +60,9 @@ func run() error {
 	// Клиент отправляет исходящие RPC; сервер ниже принимает входящие запросы.
 	client := &http.Client{Timeout: *rpcTimeout}
 	defer client.CloseIdleConnections()
-	// Одному Node передаём его конфигурацию, локальное хранилище и HTTP-транспорт.
+	// Одному Node передаём его конфигурацию и HTTP-транспорт. Всё состояние — в памяти.
 	node, err := raft.New(raft.Config{ID: *id, Peers: peers, ElectionMin: *electionMin, ElectionMax: *electionMax, Heartbeat: *heartbeat},
-		raft.FileStorage{Path: filepath.Join(*data, "state.json")}, raft.HTTPTransport{Client: client}, slog.Default())
+		raft.HTTPTransport{Client: client}, slog.Default())
 	if err != nil {
 		return err
 	}

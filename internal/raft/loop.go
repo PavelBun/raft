@@ -36,31 +36,21 @@ func (n *Node) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case now := <-ticker.C:
-			if err := n.handleTick(ctx, now, &workers); err != nil {
-				return err
-			}
+			n.handleTick(ctx, now, &workers)
 		}
 	}
 }
 
 // handleTick проверяет сроки действий под mutex, затем запускает сеть без mutex.
 // Вызывается только из Run: добавление задач в workers не пересекается с Wait.
-func (n *Node) handleTick(ctx context.Context, now time.Time, workers *sync.WaitGroup) error {
+func (n *Node) handleTick(ctx context.Context, now time.Time, workers *sync.WaitGroup) {
 	n.mu.Lock()
-	if n.failure != nil {
-		err := n.failure
-		n.mu.Unlock()
-		return err
-	}
 	if n.role != Leader && !now.Before(n.deadline) {
-		if err := n.startElectionLocked(); err != nil {
-			n.mu.Unlock()
-			return err
-		}
+		n.startElectionLocked()
 		req := n.voteRequestLocked()
 		n.mu.Unlock()
 		n.broadcastVoteRequests(ctx, workers, req)
-		return nil
+		return
 	}
 	// Лидер шлёт AppendEntries раз в Heartbeat или сразу после новой команды клиента:
 	// тогда Propose обнуляет nextHeartbeat.
@@ -69,8 +59,7 @@ func (n *Node) handleTick(ctx context.Context, now time.Time, workers *sync.Wait
 		n.nextHeartbeat = now.Add(n.cfg.Heartbeat)
 		n.mu.Unlock()
 		n.broadcastAppendEntries(ctx, workers, term)
-		return nil
+		return
 	}
 	n.mu.Unlock()
-	return nil
 }

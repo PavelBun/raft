@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
@@ -28,8 +27,7 @@ type Config struct {
 }
 
 // Entry — одна запись журнала. Индексы начинаются с 1, Term — срок лидера,
-// который создал запись. Command пока просто строка: смысл ей придаст
-// машина состояний (key-value) на следующем этапе.
+// который создал запись. Command — команда машины состояний, например "set a 1".
 type Entry struct {
 	Index   uint64 `json:"index"`
 	Term    uint64 `json:"term"`
@@ -60,9 +58,14 @@ type AppendEntriesRequest struct {
 	Entries      []Entry `json:"entries"`
 	LeaderCommit uint64  `json:"leader_commit"`
 }
+
+// ConflictTerm/ConflictIndex — подсказка при отказе (оптимизация из конца §5.3):
+// по ней лидер перескакивает через весь расходящийся срок, а не идёт по одной записи.
 type AppendEntriesResponse struct {
-	Term    uint64 `json:"term"`
-	Success bool   `json:"success"`
+	Term          uint64 `json:"term"`
+	Success       bool   `json:"success"`
+	ConflictTerm  uint64 `json:"conflict_term,omitempty"`
+	ConflictIndex uint64 `json:"conflict_index,omitempty"`
 }
 
 // Transport отделяет правила Raft от конкретного способа передачи сообщений.
@@ -87,7 +90,15 @@ type Status struct {
 	NextIndex    map[string]uint64 `json:"next_index,omitempty"`  // Только у лидера.
 	MatchIndex   map[string]uint64 `json:"match_index,omitempty"` // Только у лидера.
 	Peers        map[string]string `json:"peers"`
-	Error        string            `json:"error,omitempty"`
+}
+
+// В Figure 2 это постоянное состояние: currentTerm, votedFor и log[].
+// По условию задания узел хранит его только в памяти. После перезапуска процесс
+// начинает с пустого журнала и срока 0 и догоняет лидера как новый узел.
+type PersistentState struct {
+	Term     uint64
+	VotedFor string
+	Log      []Entry
 }
 
 // Node хранит общее состояние для цикла Raft и входящих HTTP-обработчиков.
@@ -96,34 +107,30 @@ type Status struct {
 type Node struct {
 	mu        sync.Mutex
 	cfg       Config
-	storage   Storage
 	transport Transport
 	logger    *slog.Logger
-	// Постоянное состояние из Figure 2: currentTerm, votedFor и log[].
-	// Сохраняется на диск до ответа на RPC.
-	state    PersistentState
-	role     Role
-	leaderID string
-	votes    int
-	// Изменчивое состояние любого узла: после перезапуска начинается с нуля.
+	state     PersistentState // currentTerm, votedFor и журнал.
+	role      Role
+	leaderID  string
+	votes     int
+	// Изменчивое состояние любого узла.
 	commitIndex uint64 // Наибольший индекс, про который известно, что он зафиксирован.
 	lastApplied uint64 // Наибольший индекс, применённый к машине состояний.
 	// Изменчивое состояние лидера: заново заполняется после каждых выборов.
 	nextIndex  map[string]uint64 // Какую запись отправить каждому peer следующей.
 	matchIndex map[string]uint64 // До какого индекса журнал peer точно совпадает с нашим.
-	// changed закрывается при смене commitIndex, срока или журнала:
-	// так ожидающий клиентский запрос узнаёт, что пора перепроверить запись.
-	changed       chan struct{}
+	kv         KV                // Машина состояний: key-value в памяти.
+	// Клиенты, ждущие выполнения своих записей: индекс → канал для результата.
+	waiters       map[uint64]waiter
 	deadline      time.Time // Когда начать выборы, если не придёт актуальный AppendEntries.
 	nextHeartbeat time.Time // Когда лидеру отправить следующий AppendEntries.
-	failure       error
 	running       bool
 }
 
-// New загружает срок, голос и журнал с диска и создаёт узел в роли follower.
-func New(cfg Config, storage Storage, transport Transport, logger *slog.Logger) (*Node, error) {
-	if cfg.ID == "" || storage == nil || transport == nil {
-		return nil, errors.New("id, storage and transport are required")
+// New создаёт узел в роли follower с пустым журналом.
+func New(cfg Config, transport Transport, logger *slog.Logger) (*Node, error) {
+	if cfg.ID == "" || transport == nil {
+		return nil, errors.New("id and transport are required")
 	}
 	if cfg.Heartbeat <= 0 || cfg.ElectionMin <= 2*cfg.Heartbeat || cfg.ElectionMax <= cfg.ElectionMin {
 		return nil, errors.New("require 0 < 2*heartbeat < election-min < election-max")
@@ -136,32 +143,13 @@ func New(cfg Config, storage Storage, transport Transport, logger *slog.Logger) 
 		peers[id] = address
 	}
 	cfg.Peers = peers
-	state, err := storage.Load()
-	if err != nil {
-		return nil, err
-	}
-	if err := validateLog(state); err != nil {
-		return nil, fmt.Errorf("stored state: %w", err)
-	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	n := &Node{cfg: cfg, storage: storage, transport: transport, logger: logger, state: state, role: Follower, changed: make(chan struct{})}
+	n := &Node{cfg: cfg, transport: transport, logger: logger, role: Follower,
+		kv: NewKV(), waiters: make(map[uint64]waiter)}
 	n.resetDeadlineLocked()
 	return n, nil
-}
-
-// Журнал с диска должен идти подряд с индекса 1, а сроки записей — не убывать
-// и не превышать текущий срок узла.
-func validateLog(state PersistentState) error {
-	var prevTerm uint64
-	for i, e := range state.Log {
-		if e.Index != uint64(i)+1 || e.Term == 0 || e.Term < prevTerm || e.Term > state.Term {
-			return fmt.Errorf("invalid log entry at position %d", i+1)
-		}
-		prevTerm = e.Term
-	}
-	return nil
 }
 
 // Большинство считается от всего фиксированного состава, включая недоступные узлы.
@@ -185,40 +173,21 @@ func (n *Node) resetDeadlineLocked() {
 	n.deadline = time.Now().Add(n.cfg.ElectionMin + time.Duration(rand.Int64N(int64(n.cfg.ElectionMax-n.cfg.ElectionMin))))
 }
 
-// Будим всех, кто ждёт изменения состояния (клиентов POST /log).
-func (n *Node) notifyLocked() {
-	close(n.changed)
-	n.changed = make(chan struct{})
-}
-
 // Переход в follower. Состояние лидера (nextIndex, matchIndex) больше не нужно.
 func (n *Node) becomeFollowerLocked(leaderID string) {
 	n.role, n.leaderID, n.votes = Follower, leaderID, 0
 	n.nextIndex, n.matchIndex = nil, nil
 }
 
-// При ошибке диска прекращаем участие: нельзя подтверждать несохранённые данные.
-func (n *Node) persistLocked() error {
-	if err := n.storage.Save(n.state); err != nil {
-		n.failure = fmt.Errorf("persist state: %w", err)
-		n.becomeFollowerLocked("")
-		n.notifyLocked()
-		return n.failure
-	}
-	return nil
-}
-
 // Больший срок переводит любой узел в follower и очищает голос старого срока.
 // Журнал при этом сохраняется: меняются только currentTerm и votedFor.
-func (n *Node) observeTermLocked(term uint64) error {
+func (n *Node) observeTermLocked(term uint64) {
 	if term <= n.state.Term {
-		return nil
+		return
 	}
 	n.state.Term, n.state.VotedFor = term, ""
 	n.becomeFollowerLocked("")
 	n.resetDeadlineLocked()
-	n.notifyLocked()
-	return n.persistLocked()
 }
 
 func (n *Node) member(id string) bool {
@@ -244,12 +213,8 @@ func copyMap[V any](m map[string]V) map[string]V {
 func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	s := Status{ID: n.cfg.ID, Role: n.role, Term: n.state.Term, LeaderID: n.leaderID,
+	return Status{ID: n.cfg.ID, Role: n.role, Term: n.state.Term, LeaderID: n.leaderID,
 		VotedFor: n.state.VotedFor, Votes: n.votes, ClusterSize: len(n.cfg.Peers) + 1, Majority: n.majority(),
 		LastLogIndex: n.lastLogIndex(), LastLogTerm: n.lastLogTerm(), CommitIndex: n.commitIndex, LastApplied: n.lastApplied,
 		NextIndex: copyMap(n.nextIndex), MatchIndex: copyMap(n.matchIndex), Peers: copyMap(n.cfg.Peers)}
-	if n.failure != nil {
-		s.Error = n.failure.Error()
-	}
-	return s
 }
